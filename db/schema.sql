@@ -328,43 +328,6 @@ CREATE TABLE IF NOT EXISTS ledger_entry (
   INDEX (business_id, measured_at DESC)
 );
 
--- What the owner actually counted. The only source of a verified verdict.
---
--- Without this table `NoOutcomeSource` is the only outcome source that exists,
--- every verdict the Meter can ever reach is ESTIMATED, and the published hit
--- rate is permanently undefined. A move is measured when the person who runs
--- the business says what it earned — item sales, covers, a POS export — so
--- that is what this stores.
---
--- Reported in the owner's own units, because nobody knows their takings per
--- day: `amount_cents` over `basis` is what they typed, and `daily_cents` is
--- the figure derived from them for the ledger to judge. Both are kept so the
--- number can be shown back the way it was entered.
---
--- Append-only. A corrected figure is a new row; the Meter reads the newest per
--- find. Overwriting would destroy the record of what was believed when a
--- verdict was reached, which is the one thing the ledger exists to preserve.
-CREATE TABLE IF NOT EXISTS find_outcome (
-  id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  business_id            UUID NOT NULL REFERENCES business(id) ON DELETE CASCADE,
-  find_id                UUID NOT NULL REFERENCES find(id) ON DELETE CASCADE,
-  -- Who said so. NULL survives the account being deleted; the measurement is
-  -- still a fact about the business.
-  reported_by_account_id UUID REFERENCES owner_account(id) ON DELETE SET NULL,
-
-  amount_cents           BIGINT NOT NULL,     -- as entered, integer cents
-  basis                  STRING NOT NULL,     -- 'day' | 'week' | 'month'
-  daily_cents            BIGINT NOT NULL,     -- derived; what the Meter judges
-  note                   STRING,              -- how the owner knows
-
-  reported_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-
-  -- The Meter's lookup: newest report per find, and the comparison against
-  -- ledger_entry.measured_at that decides whether an estimate is stale.
-  INDEX find_outcome_find_idx (find_id, reported_at DESC),
-  INDEX (business_id, reported_at DESC)
-);
-
 -- ---------------------------------------------------------------------------
 -- Owners: who may see a business, and how they prove it
 -- ---------------------------------------------------------------------------
@@ -413,6 +376,45 @@ UPDATE owner_account
 SET email = 'peter.flp.2006@gmail.com'
 WHERE business_id IS NOT NULL
   AND (email IS NULL OR trim(email) = '');
+
+-- Lives below owner_account on purpose: it references owner_account(id), and
+-- on a fresh cluster the referenced table has to exist first.
+-- What the owner actually counted. The only source of a verified verdict.
+--
+-- Without this table `NoOutcomeSource` is the only outcome source that exists,
+-- every verdict the Meter can ever reach is ESTIMATED, and the published hit
+-- rate is permanently undefined. A move is measured when the person who runs
+-- the business says what it earned — item sales, covers, a POS export — so
+-- that is what this stores.
+--
+-- Reported in the owner's own units, because nobody knows their takings per
+-- day: `amount_cents` over `basis` is what they typed, and `daily_cents` is
+-- the figure derived from them for the ledger to judge. Both are kept so the
+-- number can be shown back the way it was entered.
+--
+-- Append-only. A corrected figure is a new row; the Meter reads the newest per
+-- find. Overwriting would destroy the record of what was believed when a
+-- verdict was reached, which is the one thing the ledger exists to preserve.
+CREATE TABLE IF NOT EXISTS find_outcome (
+  id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id            UUID NOT NULL REFERENCES business(id) ON DELETE CASCADE,
+  find_id                UUID NOT NULL REFERENCES find(id) ON DELETE CASCADE,
+  -- Who said so. NULL survives the account being deleted; the measurement is
+  -- still a fact about the business.
+  reported_by_account_id UUID REFERENCES owner_account(id) ON DELETE SET NULL,
+
+  amount_cents           BIGINT NOT NULL,     -- as entered, integer cents
+  basis                  STRING NOT NULL,     -- 'day' | 'week' | 'month'
+  daily_cents            BIGINT NOT NULL,     -- derived; what the Meter judges
+  note                   STRING,              -- how the owner knows
+
+  reported_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+  -- The Meter's lookup: newest report per find, and the comparison against
+  -- ledger_entry.measured_at that decides whether an estimate is stale.
+  INDEX find_outcome_find_idx (find_id, reported_at DESC),
+  INDEX (business_id, reported_at DESC)
+);
 
 CREATE TABLE IF NOT EXISTS owner_session (
   token_hash    STRING PRIMARY KEY,

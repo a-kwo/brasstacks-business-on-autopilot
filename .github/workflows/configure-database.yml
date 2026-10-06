@@ -1,0 +1,195 @@
+name: Configure Database
+
+# Point the deployed stack at a (new or rotated) CockroachDB cluster, entirely
+# in CI, using the secrets already configured for deployment.
+#
+#   1. Apply db/schema.sql to the cluster named by the COCKROACH_DATABASE_URL
+#      secret (cluster settings first, falling back to --schema-only when the
+#      SQL user is not an admin).
+#   2. Copy that secret into Parameter Store as /brasstacks/COCKROACH_DATABASE_URL,
+#      plus the optional non-secret COCKROACH_CLUSTER_ID the Ask agent uses to
+#      skip cluster discovery.
+#   3. Force a cold start of every Lambda in the stack. secrets.py reads
+#      Parameter Store once per execution environment, so without this a warm
+#      container keeps the old connection string (deploy/README.md, "Rotating a
+#      secret needs a cold start").
+#   4. Smoke-test the orders endpoint: a 401 means the handler reached the
+#      database and then asked for a session; 500/503 means it did not.
+#
+# Run this after updating the COCKROACH_DATABASE_URL repository secret. It
+# never prints the connection string.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_id:
+        description: "CockroachDB Cloud cluster id (from the console URL); empty leaves the current value"
+        type: string
+        default: ""
+      run_migration:
+        description: "Apply db/schema.sql before switching the stack over"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brasstacks-deployment
+  cancel-in-progress: false
+
+jobs:
+  configure-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: brasstacks
+      SSM_PREFIX: /brasstacks
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Require the connection string secret
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+        run: |
+          if [ -z "$COCKROACH_DATABASE_URL" ]; then
+            echo "The COCKROACH_DATABASE_URL repository secret is empty. Set it first:"
+            echo "  gh secret set COCKROACH_DATABASE_URL"
+            exit 1
+          fi
+          case "$COCKROACH_DATABASE_URL" in
+            postgresql://*|postgres://*) ;;
+            *) echo "COCKROACH_DATABASE_URL does not look like a postgresql:// URL."; exit 1 ;;
+          esac
+          echo "Connection string secret is present."
+
+      - name: Set up Python
+        if: ${{ inputs.run_migration }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install backend
+        if: ${{ inputs.run_migration }}
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f backend/requirements-dev.txt ]; then
+            pip install -r backend/requirements-dev.txt
+          elif [ -f backend/pyproject.toml ]; then
+            pip install -e "backend[dev]"
+          else
+            pip install -r backend/requirements.txt
+          fi
+
+      - name: Apply the CockroachDB schema
+        if: ${{ inputs.run_migration }}
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+        run: |
+          # Cluster settings (vector indexes) need an admin SQL user. The console's
+          # default user is one; a scoped app user is not, so fall back.
+          if ! python db/migrate.py; then
+            echo "Cluster settings step failed; retrying with --schema-only."
+            python db/migrate.py --schema-only
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Confirm AWS account
+        run: aws sts get-caller-identity
+
+      - name: Write the connection string to Parameter Store
+        env:
+          COCKROACH_DATABASE_URL: ${{ secrets.COCKROACH_DATABASE_URL }}
+          CLUSTER_ID: ${{ inputs.cluster_id }}
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter \
+            --type SecureString \
+            --overwrite \
+            --name "$SSM_PREFIX/COCKROACH_DATABASE_URL" \
+            --value "$COCKROACH_DATABASE_URL" \
+            --region "$AWS_REGION" >/dev/null
+          echo "Wrote $SSM_PREFIX/COCKROACH_DATABASE_URL"
+
+          if [ -n "$CLUSTER_ID" ]; then
+            aws ssm put-parameter \
+              --type String \
+              --overwrite \
+              --name "$SSM_PREFIX/COCKROACH_CLUSTER_ID" \
+              --value "$CLUSTER_ID" \
+              --region "$AWS_REGION" >/dev/null
+            echo "Wrote $SSM_PREFIX/COCKROACH_CLUSTER_ID"
+          fi
+
+      - name: Force a cold start of every Lambda in the stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          NONCE=$(date +%s)
+          FUNCTIONS=$(aws cloudformation list-stack-resources \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
+            --output text)
+
+          if [ -z "$FUNCTIONS" ]; then
+            echo "No Lambda functions found in stack $STACK_NAME."
+            exit 1
+          fi
+
+          for fn in $FUNCTIONS; do
+            aws lambda get-function-configuration \
+              --function-name "$fn" --region "$AWS_REGION" \
+              --query 'Environment' --output json > /tmp/env.json
+            jq --arg nonce "$NONCE" \
+              '.Variables = (.Variables // {}) | .Variables.DEPLOY_NONCE = $nonce' \
+              /tmp/env.json > /tmp/env-updated.json
+            aws lambda update-function-configuration \
+              --function-name "$fn" --region "$AWS_REGION" \
+              --environment file:///tmp/env-updated.json >/dev/null
+            echo "refreshing $fn"
+          done
+
+          for fn in $FUNCTIONS; do
+            aws lambda wait function-updated \
+              --function-name "$fn" --region "$AWS_REGION"
+          done
+          echo "All functions refreshed."
+
+      - name: Smoke-test the database path
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORDERS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='OrdersEndpoint'].OutputValue | [0]" \
+            --output text)
+          if [ -z "$ORDERS" ] || [ "$ORDERS" = "None" ]; then
+            echo "OrdersEndpoint output not found; skipping smoke test."
+            exit 0
+          fi
+          # Unauthenticated: the handler connects, looks up the session, and
+          # answers 401. A 503 here is the psycopg.Error branch; a 500 is the
+          # same failure unhandled.
+          for attempt in 1 2 3; do
+            CODE=$(curl -sS -o /tmp/orders.json -w '%{http_code}' --max-time 30 "$ORDERS" || echo "000")
+            echo "attempt $attempt: HTTP $CODE $(cat /tmp/orders.json)"
+            if [ "$CODE" = "401" ]; then
+              echo "The API reached CockroachDB."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "The API still cannot reach the database. Check the LoginFunction logs in CloudWatch."
+          exit 1
